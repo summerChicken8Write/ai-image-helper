@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline/promises'
+import { spawn } from 'node:child_process'
 import { stdin as input, stdout as output } from 'node:process'
 import { detectImageExtOrNull, safeBasename, polishPrompt, generateImageBase64, stopModel } from './llm_models.js'
 import { buildSystemsFromRules } from './rules_loader.js'
@@ -42,13 +43,21 @@ export async function main() {
         if (records.length > 0) {
             console.log('  2) 基于历史图片的提示词/参考图继续调优生成')
             console.log('  3) 删除某张图片及其提示词记录')
+            console.log('  4) 预览已有图片')
         } else {
             console.log('  2) （当前没有带元数据的图片，暂不可用）')
             console.log('  3) （当前没有带元数据的图片，暂不可用）')
+            console.log('  4) （当前没有带元数据的图片，暂不可用）')
         }
-        const modeRaw = (await rl.question('👉 输入 1 / 2 / 3（直接回车默认 1）：')).trim()
+        const modeRaw = (await rl.question('👉 输入 1 / 2 / 3 / 4（直接回车默认 1）：')).trim()
         const hasRecords = records.length > 0
-        const mode = modeRaw === '2' && hasRecords ? 2 : modeRaw === '3' && hasRecords ? 3 : 1
+        const mode =
+            modeRaw === '2' && hasRecords ? 2 : modeRaw === '3' && hasRecords ? 3 : modeRaw === '4' && hasRecords ? 4 : 1
+
+        if (mode === 4) {
+            await previewExistingImage(records, rl)
+            return
+        }
 
         if (mode === 3) {
             console.log('\n🗑️ 可删除的图片记录：')
@@ -199,9 +208,85 @@ export async function main() {
         console.log(`🎉 已保存：${outPath}`)
         // 图像模型生成完毕，同样尝试 stop
         await stopModel(IMAGE_MODEL)
+        // 生成完成后可在命令行中预览图片（仅在 iTerm2 + imgcat 下可用）
+        const previewNewRaw = (
+            await rl.question('🖼️ 是否在终端中预览新生成的图片？(y/N)：')
+        )
+            .trim()
+            .toLowerCase()
+        if (previewNewRaw === 'y') {
+            await previewImageWithImgcat(outPath)
+        }
+
         console.log('👋 生成完毕，脚本自动退出。')
     } finally {
         rl.close()
     }
+}
+
+function isITerm2() {
+    return process.env.TERM_PROGRAM === 'iTerm.app' || Boolean(process.env.ITERM_SESSION_ID)
+}
+
+async function previewImageWithImgcat(filePath) {
+    if (!isITerm2()) {
+        console.log(
+            `⚠️ 当前终端似乎不是 iTerm2，图片预览只在 iTerm2 中通过 imgcat 命令可用。\n   请在 iTerm2 中查看该图片或手动打开文件：${filePath}`
+        )
+        return
+    }
+
+    console.log(`\n🖼️ 使用 imgcat 预览图片：${filePath}\n`)
+
+    await new Promise((resolve) => {
+        const child = spawn('imgcat', [filePath], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+        })
+
+        child.on('error', (err) => {
+            console.log(
+                `⚠️ 调用 imgcat 失败，可能未安装或未在 PATH 中。\n   错误信息：${
+                    err?.message ?? err
+                }\n   请确认在 iTerm2 中安装并配置好 imgcat。`
+            )
+            resolve()
+        })
+
+        child.on('exit', () => {
+            resolve()
+        })
+    })
+}
+
+async function previewExistingImage(records, rl) {
+    console.log('\n🖼️ 已生成的图片记录：')
+    records.forEach((r, idx) => {
+        const shortPrompt = (r.prompt || '').slice(0, 40)
+        console.log(
+            `  [${idx + 1}] ${r.filename}  point: ${r.point || '-'}  prompt: ${
+                shortPrompt || '-'
+            }${shortPrompt.length === 40 ? '...' : ''}`
+        )
+    })
+
+    const idxRaw = (await rl.question('👉 请输入要预览的编号（直接回车取消）：')).trim()
+    if (!idxRaw) return
+    const idx = Number.parseInt(idxRaw, 10)
+    if (!Number.isFinite(idx) || idx < 1 || idx > records.length) {
+        console.log('⚠️  编号不合法，已取消预览。')
+        return
+    }
+
+    const chosen = records[idx - 1]
+    const imgPath = path.join(IMAGES_DIR, chosen.filename)
+
+    try {
+        await fs.access(imgPath)
+    } catch {
+        console.log(`⚠️ 找不到图片文件：${imgPath}，可能已被移动或删除。`)
+        return
+    }
+
+    await previewImageWithImgcat(imgPath)
 }
 
